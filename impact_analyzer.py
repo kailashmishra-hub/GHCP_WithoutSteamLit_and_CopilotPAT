@@ -553,17 +553,6 @@ def build_impact_facts(analysis: Analysis) -> dict[str, object]:
         "impacted_scenarios": impacted_scenario_facts(analysis),
     }
 
-def write_impact_facts(analysis: Analysis, output_path: Path | str = Path("runtime") / "impacts-facts.json") -> Path:
-    facts_file = Path(output_path)
-    facts_json = json.dumps(build_impact_facts(analysis), indent=2, ensure_ascii=False)
-    facts_file.parent.mkdir(parents=True, exist_ok=True)
-    facts_file.write_text(facts_json, encoding="utf-8")
-    print("\n--- BEGIN POTENTIALLY IMPACTED SCENARIO FACTS ---")
-    print(facts_json)
-    print(f"--- END FACTS (complete copy: {facts_file.resolve()}) ---", flush=True)
-    return facts_file
-
-
 def build_impact_report(analysis: Analysis) -> dict[str, object]:
     changed_by_path = {item.path: item for item in analysis.changed_files}
     return {
@@ -619,6 +608,13 @@ def write_impact_report(analysis: Analysis, output_path: Path | str = Path("runt
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text(json.dumps(build_impact_report(analysis), indent=2, ensure_ascii=False), encoding="utf-8")
     return report_file
+
+
+def remove_stale_output(output_path: Path | str) -> Path:
+    stale_file = Path(output_path)
+    if stale_file.exists():
+        stale_file.unlink()
+    return stale_file
 
 
 def _read_repo_file(repo: Path, relative_path: str, max_chars: int = 30000) -> str:
@@ -1027,25 +1023,25 @@ def cli_main() -> int:
         source_label = str(repo)
 
         impact_report_output = args.output or args.impact_report_output
+        facts_output = remove_stale_output(args.facts_output)
+        remove_stale_output(args.subset_output)
         report_file = write_impact_report(analysis, impact_report_output)
         trace_input_file, trace_prompt_file = write_trace_agent_files(
-            analysis, args.trace_input_output, args.trace_prompt_output, args.facts_output
+            analysis, args.trace_input_output, args.trace_prompt_output, facts_output
         )
-        facts_file = write_impact_facts(analysis, args.facts_output)
-        prompt_file = write_copilot_agent_prompt(args.agent_prompt_output, facts_file, args.subset_output)
+        prompt_file = write_copilot_agent_prompt(args.agent_prompt_output, facts_output, args.subset_output)
     except Exception as exc:
         print(f"Impact analysis failed: {exc}")
         return 1
 
     changed_classes = len(analysis.changed_files)
-    impacted_scenarios = len(analysis.impacts)
     print(f"Analyzed: {source_label}")
     print(f"Changed class files: {changed_classes}")
-    print(f"Impacted scenarios: {impacted_scenarios}")
+    print(f"Deterministic trace hints: {len(analysis.impacts)}")
     print(f"Impact report written to: {report_file.resolve()}")
     print(f"Trace Agent input written to: {trace_input_file.resolve()}")
     print(f"Trace Agent prompt written to: {trace_prompt_file.resolve()}")
-    print(f"Deterministic fallback impact facts written to: {facts_file.resolve()}")
+    print(f"Trace Agent facts output target: {facts_output.resolve()}")
     print(f"Copilot Agent prompt written to: {prompt_file.resolve()}")
     print(f"Copilot Agent subset output target: {Path(args.subset_output).resolve()}")
     return 0

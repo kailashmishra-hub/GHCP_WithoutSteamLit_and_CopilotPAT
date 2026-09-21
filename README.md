@@ -30,12 +30,15 @@ The analyzer writes:
     runtime/impact-report.json
     runtime/trace-agent-input.json
     runtime/trace-agent-prompt.md
-    runtime/impacts-facts.json
     runtime/copilot-agent-prompt.md
 
 The key first output for the Trace Agent is:
 
     runtime/trace-agent-input.json
+
+The analyzer does not write `runtime/impacts-facts.json`. That file is created
+only after the Trace Agent runs, or after you explicitly save Trace Agent JSON
+with `--save-trace-response`.
 
 Run the Trace Agent from GHCP/IDE
 ---------------------------------
