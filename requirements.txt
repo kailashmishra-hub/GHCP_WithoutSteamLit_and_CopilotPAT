@@ -1,2 +1,0 @@
-streamlit>=1.36.0
-github-copilot-sdk>=1.0.0

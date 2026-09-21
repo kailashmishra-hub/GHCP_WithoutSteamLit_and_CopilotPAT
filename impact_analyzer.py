@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
 import tempfile
 import json
-import base64
 import shutil
-import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, quote, unquote, urlparse
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 
 SOURCE_SUFFIXES = {".java", ".kt", ".kts", ".groovy", ".scala", ".py", ".cs", ".js", ".jsx", ".ts", ".tsx"}
@@ -23,10 +17,6 @@ IGNORED_PARTS = {".git", ".idea", ".venv", "node_modules", "target", "build", "d
 ANNOTATION = re.compile(r'@(?:Given|When|Then|And|But)\s*\(\s*(["\'])(.*?)\1\s*\)', re.S)
 SCENARIO_LINE = re.compile(r"^\s*(Scenario(?: Outline)?):\s*(.+?)\s*$", re.I)
 STEP_LINE = re.compile(r"^\s*(Given|When|Then|And|But|\*)\s+(.+?)\s*$", re.I)
-
-
-class NoActivePullRequest(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -123,304 +113,6 @@ def default_base(repo: Path) -> str:
         if ref in refs:
             return ref
     raise RuntimeError("No master/main ref found. Select a base ref explicitly.")
-
-
-def parse_pull_request_url(value: str) -> tuple[str, str, int] | None:
-    parsed = urlparse(value.strip())
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
-        return None
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) != 4 or parts[2] != "pull" or not parts[3].isdigit():
-        return None
-    return parts[0], parts[1], int(parts[3])
-
-
-def parse_github_pull_location(value: str) -> tuple[str, str, int | None] | None:
-    parsed = urlparse(value.strip())
-    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
-        return None
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) == 3 and parts[2] == "pulls":
-        return parts[0], parts[1], None
-    specific = parse_pull_request_url(value)
-    return specific if specific else None
-
-
-def parse_azure_pull_request_url(value: str) -> tuple[str, str, str, int] | None:
-    parsed = urlparse(value.strip())
-    if parsed.scheme not in {"http", "https"}:
-        return None
-    host = parsed.netloc.lower()
-    parts = [part for part in parsed.path.split("/") if part]
-    if host == "dev.azure.com":
-        if len(parts) != 6 or parts[2].lower() != "_git" or parts[4].lower() != "pullrequest":
-            return None
-        organization, project, repository, number = parts[0], parts[1], parts[3], parts[5]
-    elif host.endswith(".visualstudio.com"):
-        if len(parts) != 5 or parts[1].lower() != "_git" or parts[3].lower() != "pullrequest":
-            return None
-        organization = host.removesuffix(".visualstudio.com")
-        project, repository, number = parts[0], parts[2], parts[4]
-    else:
-        return None
-    return tuple(map(unquote, (organization, project, repository))) + (int(number),) if number.isdigit() else None
-
-
-def parse_azure_branch_url(value: str) -> tuple[str, str, str, str] | None:
-    parsed = urlparse(value.strip().replace("\\_", "_"))
-    if parsed.scheme not in {"http", "https"}:
-        return None
-    host = parsed.netloc.lower()
-    parts = [unquote(part) for part in parsed.path.split("/") if part]
-    if host == "dev.azure.com":
-        if len(parts) != 4 or parts[2].lower() != "_git":
-            return None
-        organization, project, repository = parts[0], parts[1], parts[3]
-    elif host.endswith(".visualstudio.com"):
-        if len(parts) != 3 or parts[1].lower() != "_git":
-            return None
-        organization = host.removesuffix(".visualstudio.com")
-        project, repository = parts[0], parts[2]
-    else:
-        return None
-    version = parse_qs(parsed.query).get("version", [""])[0]
-    if not version.startswith("GB") or len(version) <= 2:
-        return None
-    branch = unquote(version[2:]).rstrip("…")
-    return organization, project, repository, branch
-
-
-def _remote_repository(remote_url: str) -> tuple[str, str] | None:
-    match = re.search(r"github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?$", remote_url.strip(), re.I)
-    return (match.group(1), match.group(2)) if match else None
-
-
-def fetch_pull_request(repo: Path, pull_request_url: str, github_token: str = "") -> str:
-    parsed = parse_pull_request_url(pull_request_url)
-    if parsed is None:
-        raise RuntimeError("Enter a complete GitHub pull-request URL such as https://github.com/owner/repo/pull/1.")
-    owner, repository, number = parsed
-    remote_url = run_git(repo, "remote", "get-url", "origin").strip()
-    remote_repo = _remote_repository(remote_url)
-    if remote_repo is None or tuple(part.lower() for part in remote_repo) != (owner.lower(), repository.lower()):
-        raise RuntimeError(
-            f"The pull request belongs to {owner}/{repository}, but the selected repository origin is {remote_url}."
-        )
-    target_ref = f"refs/impact-tracker/pull/{number}"
-    _github_git(
-        repo, github_token, "fetch", "--force", "origin", f"refs/pull/{number}/head:{target_ref}"
-    )
-    return target_ref
-
-
-def _github_api(path: str, github_token: str = ""):
-    url = f"https://api.github.com{path}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "GHCP-impact-tracker",
-    }
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
-    request = Request(
-        url,
-        headers=headers,
-    )
-    try:
-        with urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise RuntimeError(f"GitHub API returned HTTP {exc.code}.") from exc
-    except URLError as exc:
-        command = ["curl.exe", "--fail", "--silent", "--show-error", "--location", "--max-time", "30"]
-        for name, value in headers.items():
-            command.extend(["--header", f"{name}: {value}"])
-        command.append(url)
-        try:
-            completed = subprocess.run(
-                command, text=True, encoding="utf-8", errors="replace", capture_output=True,
-            )
-        except OSError as curl_exc:
-            raise RuntimeError(
-                f"Unable to connect to the GitHub API with Python or curl: {exc.reason}"
-            ) from curl_exc
-        if completed.returncode:
-            detail = completed.stderr.strip() or f"curl exited with code {completed.returncode}"
-            raise RuntimeError(
-                f"Unable to connect to the GitHub API with Python ({exc.reason}) or curl ({detail})."
-            ) from exc
-        try:
-            return json.loads(completed.stdout)
-        except json.JSONDecodeError as json_exc:
-            raise RuntimeError("GitHub returned an invalid API response through curl.") from json_exc
-
-
-def _azure_api(url: str, pat: str = ""):
-    headers = {"Accept": "application/json", "User-Agent": "GHCP-impact-tracker"}
-    if pat:
-        token = base64.b64encode(f":{pat}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {token}"
-    request = Request(url, headers=headers)
-    try:
-        with urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        message = " Check the Azure DevOps PAT and its Code (Read) permission." if exc.code in {401, 403} else ""
-        raise RuntimeError(f"Azure DevOps API returned HTTP {exc.code}.{message}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Unable to connect to Azure DevOps: {exc.reason}") from exc
-
-
-def _azure_git(repo: Path | None, pat: str, *args: str) -> None:
-    command = ["git", "-c", "core.longpaths=true"]
-    if pat:
-        token = base64.b64encode(f":{pat}".encode("utf-8")).decode("ascii")
-        command += ["-c", f"http.extraHeader=Authorization: Basic {token}"]
-    command += list(args)
-    completed = subprocess.run(
-        command, cwd=repo, text=True, encoding="utf-8", errors="replace", capture_output=True,
-    )
-    if completed.returncode:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Azure Git operation failed.")
-
-
-def _github_git(repo: Path | None, github_token: str, *args: str) -> None:
-    command = ["git", "-c", "core.longpaths=true"]
-    if github_token:
-        credentials = base64.b64encode(
-            f"x-access-token:{github_token}".encode("utf-8")
-        ).decode("ascii")
-        command += ["-c", f"http.extraHeader=Authorization: Basic {credentials}"]
-    command += list(args)
-    completed = subprocess.run(
-        command, cwd=repo, text=True, encoding="utf-8", errors="replace", capture_output=True,
-    )
-    if completed.returncode:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "GitHub Git operation failed.")
-
-
-def prepare_remote_pull_repository(
-    pull_location_url: str, github_token: str = ""
-) -> tuple[Path, int, str]:
-    location = parse_github_pull_location(pull_location_url)
-    if location is None:
-        raise RuntimeError("Enter a GitHub PR URL ending in /pull/NUMBER or a repository PR-list URL ending in /pulls.")
-    owner, repository, requested_number = location
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repository):
-        raise RuntimeError("The GitHub repository URL contains unsupported characters.")
-    remote_url = f"https://github.com/{owner}/{repository}.git"
-    if requested_number is None:
-        open_pulls = _github_api(
-            f"/repos/{owner}/{repository}/pulls?state=open&per_page=100", github_token
-        )
-        if not open_pulls:
-            raise NoActivePullRequest("No open pull requests were found for this repository.")
-        pull_data = max(open_pulls, key=lambda item: item["number"])
-        number = int(pull_data["number"])
-    else:
-        number = requested_number
-        pull_data = _github_api(f"/repos/{owner}/{repository}/pulls/{number}", github_token)
-        if pull_data.get("merged_at"):
-            raise NoActivePullRequest(f"Pull request #{number} is already merged; there are no active PR differences to analyze.")
-        if pull_data.get("state") != "open":
-            raise NoActivePullRequest(f"Pull request #{number} is closed; there are no active PR differences to analyze.")
-    base_ref = f"origin/{pull_data['base']['ref']}"
-
-    destination = Path(tempfile.gettempdir()) / "ghcp-impact-prs" / f"{owner}-{repository}-pr-{number}"
-    if not (destination / ".git").is_dir():
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _github_git(None, github_token, "clone", "--no-checkout", remote_url, str(destination))
-    repo = validate_repo(destination)
-    target_ref = fetch_pull_request(
-        repo, f"https://github.com/{owner}/{repository}/pull/{number}", github_token
-    )
-    run_git(repo, "checkout", "--detach", "--force", target_ref)
-    return repo, number, base_ref
-
-
-def prepare_azure_pull_repository(pull_request_url: str, pat: str = "") -> tuple[Path, int, str]:
-    parsed = parse_azure_pull_request_url(pull_request_url)
-    if parsed is None:
-        raise RuntimeError(
-            "Enter an Azure DevOps PR URL such as "
-            "https://dev.azure.com/organization/project/_git/repository/pullrequest/123."
-        )
-    organization, project, repository, number = parsed
-    encoded_project, encoded_repository = quote(project, safe=""), quote(repository, safe="")
-    api_url = (
-        f"https://dev.azure.com/{quote(organization, safe='')}/{encoded_project}/_apis/git/"
-        f"repositories/{encoded_repository}/pullrequests/{number}?api-version=7.1"
-    )
-    pull_data = _azure_api(api_url, pat)
-    status = str(pull_data.get("status", "")).lower()
-    if status == "completed":
-        raise NoActivePullRequest(
-            f"Azure DevOps pull request #{number} is already completed; there are no active PR differences to analyze."
-        )
-    if status != "active":
-        raise NoActivePullRequest(
-            f"Azure DevOps pull request #{number} is {status or 'not active'}; there are no active PR differences to analyze."
-        )
-
-    target_branch = str(pull_data.get("targetRefName", ""))
-    source_branch = str(pull_data.get("sourceRefName", ""))
-    if not target_branch.startswith("refs/heads/") or not source_branch.startswith("refs/heads/"):
-        raise RuntimeError("The Azure DevOps PR did not provide valid source and target branches.")
-    target_name = target_branch.removeprefix("refs/heads/")
-    base_ref = f"origin/{target_name}"
-
-    target_repository = pull_data.get("repository") or {}
-    remote_url = target_repository.get("remoteUrl") or (
-        f"https://dev.azure.com/{organization}/{encoded_project}/_git/{encoded_repository}"
-    )
-    fork_repository = ((pull_data.get("forkSource") or {}).get("repository") or {})
-    source_url = fork_repository.get("remoteUrl") or remote_url
-    destination = (
-        Path(tempfile.gettempdir()) / "ghcp-impact-azure-prs" /
-        f"{organization}-{project}-{repository}-pr-{number}"
-    )
-    if not (destination / ".git").is_dir():
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _azure_git(None, pat, "clone", "--no-checkout", remote_url, str(destination))
-    repo = validate_repo(destination)
-    _azure_git(
-        repo, pat, "fetch", "--force", "origin",
-        f"+{target_branch}:refs/remotes/origin/{target_name}",
-    )
-    target_ref = f"refs/impact-tracker/azure-pull/{number}"
-    _azure_git(repo, pat, "fetch", "--force", source_url, f"+{source_branch}:{target_ref}")
-    run_git(repo, "checkout", "--detach", "--force", target_ref)
-    return repo, number, base_ref
-
-
-def prepare_azure_branch_repository(branch_url: str, pat: str = "") -> tuple[Path, str, str]:
-    parsed = parse_azure_branch_url(branch_url)
-    if parsed is None:
-        raise RuntimeError(
-            "Enter an Azure DevOps branch URL containing ?version=GBbranch-name."
-        )
-    organization, project, repository, branch = parsed
-    remote_url = (
-        f"https://dev.azure.com/{quote(organization, safe='')}/{quote(project, safe='')}/"
-        f"_git/{quote(repository, safe='')}"
-    )
-    cache_key = hashlib.sha256(
-        f"{organization}/{project}/{repository}".encode("utf-8")
-    ).hexdigest()[:16]
-    destination = Path(tempfile.gettempdir()) / "ghcp-impact-azure-branches" / cache_key
-    if not (destination / ".git").is_dir():
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _azure_git(None, pat, "clone", "--no-checkout", remote_url, str(destination))
-    repo = validate_repo(destination)
-    base_ref = "origin/master"
-    target_ref = f"origin/{branch}"
-    _azure_git(
-        repo, pat, "fetch", "--force", "origin",
-        "+refs/heads/master:refs/remotes/origin/master",
-        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-    )
-    run_git(repo, "checkout", "--detach", "--force", target_ref)
-    return repo, target_ref, base_ref
 
 
 def _parse_name_status(output: str) -> list[tuple[str, str]]:
@@ -692,7 +384,7 @@ def _class_inheritance(repo: Path) -> dict[str, set[str]]:
         r"\bclass\s+([A-Za-z_$][\w$]*)[^{};]*?\bextends\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)"
     )
     for path in repository_files(repo):
-        if path.suffix.lower() not in SOURCE_SUFFIXES or any(part in IGNORED_PARTS for part in path.parts):
+        if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES or any(part in IGNORED_PARTS for part in path.parts):
             continue
         source = path.read_text(encoding="utf-8", errors="ignore")
         for child, parent in declaration.findall(source):
@@ -1269,14 +961,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base", default="", help="Base branch/ref. Defaults to origin/main, origin/master, main, or master.")
     parser.add_argument("--target", default="HEAD", help="Target branch/ref to compare. Defaults to HEAD.")
     parser.add_argument("--committed-only", action="store_true", help="Ignore staged, unstaged, and untracked changes.")
-    parser.add_argument("--pull-request", default="", help="GitHub pull request URL to analyze instead of the local repo.")
     parser.add_argument("--json", action="store_true", help="Accepted for compatibility. Runtime reports are always JSON.")
     parser.add_argument("--output", default="", help="Compatibility alias for --impact-report-output.")
-    parser.add_argument(
-        "--github-token",
-        default=os.environ.get("GITHUB_REPOSITORY_TOKEN", ""),
-        help="Optional GitHub token for private repositories. Defaults to GITHUB_REPOSITORY_TOKEN.",
-    )
     parser.add_argument(
         "--impact-report-output",
         default=str(Path("runtime") / "impact-report.json"),
@@ -1332,18 +1018,13 @@ def cli_main() -> int:
             print(f"Trace Agent impact facts written to: {facts_file.resolve()}")
             return 0
 
-        if args.pull_request.strip():
-            repo, pull_number, base_ref = prepare_remote_pull_repository(args.pull_request.strip(), args.github_token)
-            analysis = analyze(repo, base_ref, "HEAD", False)
-            source_label = f"GitHub pull request #{pull_number}"
+        repo = validate_repo(Path(args.repo))
+        base_ref = args.base.strip() or default_base(repo)
+        if args.target == "HEAD":
+            analysis = analyze(repo, base_ref, args.target, not args.committed_only)
         else:
-            repo = validate_repo(Path(args.repo))
-            base_ref = args.base.strip() or default_base(repo)
-            if args.target == "HEAD":
-                analysis = analyze(repo, base_ref, args.target, not args.committed_only)
-            else:
-                analysis = analyze_branch_snapshot(repo, base_ref, args.target)
-            source_label = str(repo)
+            analysis = analyze_branch_snapshot(repo, base_ref, args.target)
+        source_label = str(repo)
 
         impact_report_output = args.output or args.impact_report_output
         report_file = write_impact_report(analysis, impact_report_output)
